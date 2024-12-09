@@ -1,113 +1,82 @@
-class Account::Transfer < ApplicationRecord
-  has_many :entries, dependent: :destroy
+class Account::Transaction < ApplicationRecord
+  include Account::Entryable
 
-  validate :net_zero_flows, if: :single_currency_transfer?
-  validate :transaction_count, :from_different_accounts, :all_transactions_marked
+  belongs_to :category, optional: true
+  belongs_to :merchant, optional: true
+  has_many :taggings, as: :taggable, dependent: :destroy
+  has_many :tags, through: :taggings
 
-  def date
-    outflow_transaction&.date
-  end
+  accepts_nested_attributes_for :taggings, allow_destroy: true
 
-  def amount_money
-    entries.first&.amount_money&.abs || Money.new(0)
-  end
+  scope :active, -> { where(excluded: false) }
 
-  def from_name
-    from_account&.name || I18n.t("account/transfer.from_fallback_name")
-  end
+  # Enable optimistic locking
+  self.locking_column = :lock_version
 
-  def to_name
-    to_account&.name || I18n.t("account/transfer.to_fallback_name")
-  end
-
-  def name
-    I18n.t("account/transfer.name", from_account: from_name, to_account: to_name)
-  end
-
-  def from_account
-    outflow_transaction&.account
-  end
-
-  def to_account
-    inflow_transaction&.account
-  end
-
-  def inflow_transaction
-    entries.find { |e| e.inflow? }
-  end
-
-  def outflow_transaction
-    entries.find { |e| e.outflow? }
-  end
-
-  def update_entries!(params)
+  # Method to process a transaction safely with optimistic locking
+  def process_transaction!(amount)
     transaction do
-      entries.each do |entry|
-        entry.update!(params)
-      end
+      reload # Reload to ensure the latest version is being updated
+      update!(processed: true, amount: amount)
     end
-  end
-
-  def sync_account_later
-    entries.each(&:sync_account_later)
+  rescue ActiveRecord::StaleObjectError
+    raise "Conflict detected while processing transaction. Please retry."
   end
 
   class << self
-    def build_from_accounts(from_account, to_account, date:, amount:)
-      outflow = from_account.entries.build \
-        amount: amount.abs,
-        currency: from_account.currency,
-        date: date,
-        name: "Transfer to #{to_account.name}",
-        marked_as_transfer: true,
-        entryable: Account::Transaction.new
-
-      # Attempt to convert the amount to the to_account's currency. If the conversion fails,
-      # use the original amount.
-      converted_amount = begin
-        Money.new(amount.abs, from_account.currency).exchange_to(to_account.currency)
-      rescue Money::ConversionError
-        Money.new(amount.abs, from_account.currency)
+    def search(params)
+      query = all
+      if params[:categories].present?
+        if params[:categories].exclude?("Uncategorized")
+          query = query
+                    .joins(:category)
+                    .where(categories: { name: params[:categories] })
+        else
+          query = query
+                    .left_joins(:category)
+                    .where(categories: { name: params[:categories] })
+                    .or(query.where(category_id: nil))
+        end
       end
 
-      inflow = to_account.entries.build \
-        amount: converted_amount.amount * -1,
-        currency: converted_amount.currency.iso_code,
-        date: date,
-        name: "Transfer from #{from_account.name}",
-        marked_as_transfer: true,
-        entryable: Account::Transaction.new
+      query = query.joins(:merchant).where(merchants: { name: params[:merchants] }) if params[:merchants].present?
 
-      new entries: [ outflow, inflow ]
+      if params[:tags].present?
+        query = query.joins(:tags)
+                     .where(tags: { name: params[:tags] })
+                     .distinct
+      end
+
+      query
     end
+
+    def requires_search?(params)
+      searchable_keys.any? { |key| params.key?(key) }
+    end
+
+    private
+
+      def searchable_keys
+        %i[categories merchants tags]
+      end
+  end
+
+  def name
+    entry.name || "(no description)"
+  end
+
+  def eod_balance
+    entry.amount_money
+    
   end
 
   private
 
-    def single_currency_transfer?
-      entries.map { |e| e.currency }.uniq.size == 1
+    def account
+      entry.account
     end
 
-    def transaction_count
-      unless entries.size == 2
-        errors.add :entries, :must_have_exactly_2_entries
-      end
-    end
-
-    def from_different_accounts
-      accounts = entries.map { |e| e.account_id }.uniq
-      errors.add :entries, :must_be_from_different_accounts if accounts.size < entries.size
-    end
-
-    def net_zero_flows
-      unless entries.sum(&:amount).zero?
-        errors.add :entries, :must_have_an_inflow_and_outflow_that_net_to_zero
-      end
-    end
-
-    def all_transactions_marked
-      unless entries.all?(&:marked_as_transfer)
-        errors.add :entries, :must_be_marked_as_transfer
-      end
+    def daily_transactions
+      account.entries.account_transactions
     end
 end
